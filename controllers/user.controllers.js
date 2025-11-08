@@ -8,28 +8,42 @@ const sgMail = require("@sendgrid/mail");
 
 const User = require("../models/userModel");
 const OtpVerification = require("../models/otpVerificationModel");
+const UserFollows = require("../models/user.follows.model");
 
 const getProfileInfo = async (req, res) => {
   try {
     const { user } = req;
-    const { username } = req.query;
+    const { username: userName } = req.query;
 
-    //Get latest userdata
-    const findCondition = username ? { userName } : { _id: user._id };
+    // Get latest user data
+    const findCondition = userName ? { userName } : { _id: user._id };
     const userDetails = await User.findOne(findCondition).select(
       "-password -__v -googleRefreshToken -connectGmail -email -mobileNo -status"
     );
+    if (!userDetails) {
+      return res.status(400).send({
+        success: false,
+        message: "User not found",
+        data: null,
+      });
+    }
+
+    // Check if current user is following this user
+    const isUserFollowedByMe = !!(await UserFollows.findOne({
+      follower: user._id,
+      following: userDetails._id,
+    }));
 
     res.status(200).send({
       success: true,
       message: "User data fetched successfully",
-      data: { ...userDetails?._doc },
+      data: { ...userDetails._doc, isUserFollowedByMe },
     });
   } catch (err) {
-    console.error("Error in Login API", err);
+    console.error("Error in getProfileInfo", err);
     return res.status(400).send({
       success: false,
-      message: "Fail! Something error occurred in Login API",
+      message: "Fail! Something error occurred in getProfileInfo",
       data: null,
     });
   }
@@ -423,6 +437,164 @@ const getUserLogout = asyncHandler(async (req, res) => {
   }
 });
 
+const followUnfollowUser = async (req, res) => {
+  try {
+    const { userId, follow } = req.body; // userId = who to follow/unfollow
+    const currentUserId = req.user._id;
+
+    if (currentUserId.toString() === userId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "You cannot follow yourself." });
+    }
+
+    const targetUser = await User.findById(userId).select(
+      "-password -__v -googleRefreshToken -connectGmail -email -mobileNo -status"
+    );
+    if (!targetUser) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Target user not found." });
+    }
+
+    const existingFollow = await UserFollows.findOne({
+      follower: currentUserId,
+      following: userId,
+    });
+
+    if (follow) {
+      // Follow
+      if (existingFollow) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Already followed this user." });
+      }
+
+      // Create follow record
+      await UserFollows.create({ follower: currentUserId, following: userId });
+
+      // Increment counts
+      await User.findByIdAndUpdate(currentUserId, {
+        $inc: { followingCount: 1 },
+      });
+      await User.findByIdAndUpdate(userId, { $inc: { followersCount: 1 } });
+    } else {
+      // Unfollow
+      if (!existingFollow) {
+        return res.status(400).json({
+          success: false,
+          message: "You are not following this user.",
+        });
+      }
+
+      // Delete follow record
+      await UserFollows.deleteOne({ _id: existingFollow._id });
+
+      // Decrement counts
+      await User.findByIdAndUpdate(currentUserId, {
+        $inc: { followingCount: -1 },
+      });
+      await User.findByIdAndUpdate(userId, { $inc: { followersCount: -1 } });
+    }
+
+    // Fetch updated target user info
+    const updatedTargetUser = await User.findById(userId).select(
+      "-password -__v -googleRefreshToken -connectGmail -email -mobileNo -status"
+    );
+
+    // Check if current user is following after the operation
+    const isUserFollowedByMe = !!(await UserFollows.findOne({
+      follower: currentUserId,
+      following: userId,
+    }));
+
+    res.status(200).json({
+      success: true,
+      message: follow
+        ? "User followed successfully."
+        : "User unfollowed successfully.",
+      data: { ...updatedTargetUser._doc, isUserFollowedByMe },
+    });
+  } catch (err) {
+    console.error("Error in followUnfollowUser:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Something went wrong while following/unfollowing user.",
+    });
+  }
+};
+
+const getProfileSuggestions = async (req, res) => {
+  try {
+    const user = req.user; // current logged-in user
+    const { username: excludeUserName } = req.query; // optional username to exclude
+    let page = parseInt(req.query.page) || 1;
+    let limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+
+    // Step 1: Get IDs of users followed by current user
+    const followedUsers = await UserFollows.find({ follower: user._id }).select(
+      "following"
+    );
+    const followedUserIds = followedUsers.map((f) => f.following.toString());
+
+    // Step 2: Build filter
+    // Step 2: Build filter
+    let excludedIds = [user._id, ...followedUserIds]; // exclude self + already followed
+
+    if (excludeUserName) {
+      const excludedUser = await User.findOne({
+        userName: excludeUserName,
+      }).select("_id");
+      if (excludedUser) excludedIds.push(excludedUser._id);
+    }
+
+    // Query-level exclusion
+    const filter = {
+      _id: { $nin: excludedIds },
+    };
+
+    // If a username to exclude is provided
+    if (excludeUserName) {
+      const excludedUser = await User.findOne({
+        userName: excludeUserName,
+      }).select("_id");
+      if (excludedUser) filter._id.$ne = excludedUser._id;
+    }
+
+    // Step 3: Fetch users
+    const users = await User.find(filter)
+      .select(
+        "-password -__v -googleRefreshToken -connectGmail -email -mobileNo -status"
+      )
+      .sort({ followersCount: -1 }) // optional: sort by popularity
+      .skip(skip)
+      .limit(limit)
+      .lean();
+
+    // Step 4: Total count for pagination
+    const totalUsers = await User.countDocuments(filter);
+
+    return res.status(200).json({
+      success: true,
+      message: "Profile suggestions fetched successfully",
+      data: {
+        users,
+        totalUsers,
+        currentPage: page,
+        totalPages: Math.ceil(totalUsers / limit),
+        limit,
+      },
+    });
+  } catch (err) {
+    console.error("Error in getProfileSuggestions:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Something went wrong while fetching profile suggestions",
+    });
+  }
+};
+
 module.exports = {
   forgotPassword,
   otpVerification,
@@ -432,4 +604,6 @@ module.exports = {
   updateUserEmailPassword,
   getUserLogout,
   getProfileInfo,
+  followUnfollowUser,
+  getProfileSuggestions,
 };

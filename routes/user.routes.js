@@ -4,7 +4,9 @@ const upload = multer();
 
 const {
   uploadImage,
-  getProfileInfo
+  getProfileInfo,
+  followUnfollowUser,
+  getProfileSuggestions
 } = require("../controllers/user.controllers");
 const { authGuard } = require("../middleware/auth.middleware");
 
@@ -30,6 +32,8 @@ router
   .route("/upload-profile-picture")
   .post(authGuard, upload.single("profile_picture"), uploadImage);
 router.get("/profile", authGuard, getProfileInfo);
+router.post("/follow", authGuard, followUnfollowUser);
+router.get("/suggestions", authGuard, getProfileSuggestions);
 
 
 module.exports = router;
